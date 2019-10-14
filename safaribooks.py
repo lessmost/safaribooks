@@ -9,6 +9,7 @@ import logging
 import argparse
 import requests
 import traceback
+import time
 from lxml import html, etree
 from html import escape
 from random import random
@@ -28,6 +29,8 @@ ORLY_BASE_URL = "https://www." + ORLY_BASE_HOST
 SAFARI_BASE_URL = "https://" + SAFARI_BASE_HOST
 API_ORIGIN_URL = "https://" + API_ORIGIN_HOST
 
+CLIENT_SECRET = "f52b3e30b68c1820adb08609c799cb6da1c29975"
+CLIENT_ID = "446a8a270214734f42a7"
 
 class Display:
     BASE_FORMAT = logging.Formatter(
@@ -306,6 +309,8 @@ class SafariBooks:
 
         self.cookies = {}
         self.jwt = {}
+        self.use_oauth = True
+        self.accessToken = ""
 
         if not args.cred:
             if not os.path.isfile(COOKIES_FILE):
@@ -316,7 +321,7 @@ class SafariBooks:
 
         else:
             self.display.info("Logging into Safari Books Online...", state=True)
-            self.do_login(*args.cred)
+            self.do_login_oauth(*args.cred)
             if not args.no_cookies:
                 json.dump(self.cookies, open(COOKIES_FILE, "w"))
 
@@ -398,13 +403,12 @@ class SafariBooks:
         return " ".join(["{0}={1};".format(k, v) for k, v in self.cookies.items()])
 
     def return_headers(self, url):
-        if ORLY_BASE_HOST in urlsplit(url).netloc:
-            self.HEADERS["cookie"] = self.return_cookies()
+        if not self.accessToken:
+            return {}
 
-        else:
-            self.HEADERS["cookie"] = ""
-
-        return self.HEADERS
+        return {
+            "authorization": "Bearer " + self.accessToken
+        }
 
     def update_cookies(self, jar):
         for cookie in jar:
@@ -413,7 +417,7 @@ class SafariBooks:
                     cookie.name: cookie.value
                 })
 
-    def requests_provider(
+    def requests_provider_do(
             self, url, post=False, data=None, perfom_redirect=True, update_cookies=True, update_referer=True, **kwargs
     ):
         try:
@@ -430,6 +434,7 @@ class SafariBooks:
                     ["\t{}: {}".format(*h) for h in response.headers.items()]
                 ), response.text
             )
+            self.display.save_last_request()
 
         except (requests.ConnectionError, requests.ConnectTimeout, requests.RequestException) as request_exception:
             self.display.error(str(request_exception))
@@ -448,6 +453,21 @@ class SafariBooks:
             # TODO How about **kwargs?
 
         return response
+
+    def requests_provider(
+        self, url, post=False, data=None, perfom_redirect=True, update_cookies=True, update_referer=True, **kwargs
+    ):
+        retries = 0
+        response = 0
+        while response == 0 and retries < 5:
+            if retries != 0:
+                self.display.info("Crawler: retry with url" + url)
+                time.sleep(60 * retries)
+            response = self.requests_provider_do(url, post, data, perfom_redirect, update_cookies, update_referer, **kwargs)
+            retries = retries + 1
+        
+        return response
+
 
     @staticmethod
     def parse_cred(cred):
@@ -509,6 +529,29 @@ class SafariBooks:
         if response == 0:
             self.display.exit("Login: unable to reach Safari Books Online. Try again...")
 
+    def do_login_oauth(self, email, password):
+        self.display.info("OAuth Login...")
+        response = self.requests_provider(
+            SAFARI_BASE_URL + "/oauth2/access_token/",
+            post=True,
+            data={
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "grant_type": "password",
+                "username": email,
+                "password": password
+            },
+            update_cookies=False
+            )
+        
+        if response == 0:
+            self.display.exit("Login: unable to perform OAuth to Safari Books Online...")
+        
+        if response.status_code != 200:
+            self.display.exit('Login: your login went wrong and it encountered in an error.')
+
+        self.accessToken = response.json()["access_token"]
+
     def get_book_info(self):
         response = self.requests_provider(self.api_url)
         if response == 0:
@@ -523,7 +566,7 @@ class SafariBooks:
 
         return response
 
-    def get_book_chapters(self, page=1):
+    def get_book_chapters_bak(self, page=1):
         response = self.requests_provider(urljoin(self.api_url, "chapter/?page=%s" % page))
         if response == 0:
             self.display.exit("API: unable to retrieve book chapters.")
@@ -546,6 +589,15 @@ class SafariBooks:
 
         result += response["results"]
         return result + (self.get_book_chapters(page + 1) if response["next"] else [])
+
+    def get_book_chapters(self):
+        chapter_url_list = self.book_info["chapters"]
+        chapters = []
+        for i in range(len(chapter_url_list)):
+            chapters.append({
+                "url": chapter_url_list[i]
+            })
+        return chapters
 
     def get_default_cover(self):
         response = self.requests_provider(self.book_info["cover"], update_cookies=False, stream=True)
@@ -629,7 +681,9 @@ class SafariBooks:
 
         return None
 
-    def parse_html(self, root, first_page=False):
+    def parse_html(self, root, chapter_idx):
+        first_page = chapter_idx == 0
+        chapter_meta = self.book_chapters[chapter_idx]
         if random() > 0.8:
             if len(root.xpath("//div[@class='controls']/a/text()")):
                 self.display.exit(self.display.api_error(" "))
@@ -642,6 +696,23 @@ class SafariBooks:
             )
 
         page_css = ""
+
+
+        stylesheets = chapter_meta["stylesheets"]
+        if len(stylesheets):
+            for s in stylesheets:
+                css_url = s["url"]
+                css_idx = 0
+                if css_url not in self.css:
+                    self.css.append(css_url)
+                    css_idx = len(self.css) - 1
+                    self.display.log('Crawler: found a new CSS at %s' % css_url)
+                else:
+                    css_idx = self.css.index(css_url)
+
+                page_css += "<link href=\"Styles/Style{0:0>2}.css\" " \
+                            "rel=\"stylesheet\" type=\"text/css\" />\n".format(css_idx)
+
         stylesheet_links = root.xpath("//link[@rel='stylesheet']")
         if len(stylesheet_links):
             stylesheet_count = 0
@@ -769,7 +840,7 @@ class SafariBooks:
             .write(self.BASE_HTML.format(contents[0], contents[1]).encode("utf-8", 'xmlcharrefreplace'))
         self.display.log("Created: %s" % self.filename)
 
-    def get(self):
+    def get_bak(self):
         len_books = len(self.book_chapters)
 
         for _ in range(len_books):
@@ -802,6 +873,30 @@ class SafariBooks:
                 self.save_page_html(self.parse_html(self.get_html(next_chapter["web_url"]), first_page))
 
             self.display.state(len_books, len_books - len(self.chapters_queue))
+
+    def get(self):
+        len_books = len(self.book_chapters)
+        for i in range(len_books):
+            self.get_chapter(self.book_chapters[i], i)
+            self.display.state(len_books, i)
+
+    def get_chapter(self, chapter, idx):
+        # fetch chapter meta
+        chapter_url = chapter["url"]
+        response = self.requests_provider(chapter["url"])
+        if response == 0 or response.status_code != 200:
+            self.display.exit("API: unable to retrieve chapter meta: " + chapter_url)
+        chapter_meta = response.json()
+        self.chapter_title = chapter_meta["title"]
+        self.filename = escape(chapter_meta["filename"])
+        self.book_chapters[idx]["filename"] = self.filename
+        self.book_chapters[idx]["title"] = self.chapter_title
+        self.book_chapters[idx]["stylesheets"] = chapter_meta["stylesheets"]
+        content_url = chapter_meta["content"]
+
+        # fetch chapter content        
+        self.save_page_html(self.parse_html(self.get_html(content_url), idx))
+
 
     def _thread_download_css(self, url):
         css_file = os.path.join(self.css_path, "Style{0:0>2}.css".format(self.css.index(url)))
@@ -843,10 +938,10 @@ class SafariBooks:
                                               stream=True)
             if response == 0:
                 self.display.error("Error trying to retrieve this image: %s\n    From: %s" % (image_name, url))
-
-            with open(image_path, 'wb') as img:
-                for chunk in response.iter_content(1024):
-                    img.write(chunk)
+            else: 
+                with open(image_path, 'wb') as img:
+                    for chunk in response.iter_content(1024):
+                        img.write(chunk)
 
         self.images_done_queue.put(1)
         self.display.state(len(self.images), self.images_done_queue.qsize())
